@@ -153,6 +153,40 @@ def run_index_rotation(start_year, ma_win=10, tc=0.003):
     return bt['ret'], bm_r, bt
 
 
+def run_low_vol(prices, bm_rets, top_k=3, vol_window=12, trend_win=10, tc=0.003, start_year=2005):
+    """Strategy ④: Low-volatility sector rotation with inverse-vol weighting."""
+    prices = prices[prices.index.year >= start_year].copy()
+    bm     = bm_rets[bm_rets.index.year >= start_year].copy()
+    mr = prices.pct_change()
+    bm_lvl = (1+bm).cumprod()
+    bm_aln = bm_lvl.reindex(prices.index, method='ffill')
+    trend  = (bm_aln > bm_aln.rolling(trend_win).mean()).shift(1)
+    results=[]; held=set()
+    for t in range(vol_window+2, len(prices)):
+        date,prev=prices.index[t],prices.index[t-1]
+        in_mkt=bool(trend.iloc[t]) if pd.notna(trend.iloc[t]) else True
+        if not in_mkt:
+            results.append({'date':date,'ret':0.,'mode':'cash'}); held=set(); continue
+        vols={}
+        for col in prices.columns:
+            v=mr.iloc[max(0,t-vol_window):t][col].std()
+            if pd.notna(v) and v>0: vols[col]=v
+        if len(vols)<top_k:
+            results.append({'date':date,'ret':0.,'mode':'insufficient'}); continue
+        sorted_by_vol=sorted(vols, key=vols.get)
+        new_held=set(sorted_by_vol[:top_k])
+        inv_vols={c:1/vols[c] for c in new_held}
+        total=sum(inv_vols.values())
+        w={c:v/total for c,v in inv_vols.items()}
+        turn=len(held-new_held)/top_k if held else 1.
+        pr=sum(w.get(c,0)*((prices.loc[date,c]/prices.loc[prev,c])-1)
+               for c in new_held if pd.notna(prices.loc[prev,c]) and prices.loc[prev,c]>0)
+        results.append({'date':date,'ret':pr-turn*tc*2,'mode':'invested'})
+        held=new_held
+    bt=pd.DataFrame(results).set_index('date')
+    return bt['ret'], bm.reindex(bt.index).fillna(0), bt
+
+
 def run_dual_momentum(prices, bm_rets, top_k, trend_win, tc, start_year):
     """Dual-momentum: absolute + relative, defensive fallback."""
     prices=prices[prices.index.year>=start_year].copy()
@@ -197,6 +231,19 @@ def run_dual_momentum(prices, bm_rets, top_k, trend_win, tc, start_year):
         results.append({'date':date,'ret':net,'mode':mode}); held=list(new_held)
     bt=pd.DataFrame(results).set_index('date')
     return bt['ret'], bm.reindex(bt.index).fillna(0), bt
+
+def run_ensemble_blend(prices, bm_rets, trend_win=10, tc=0.003, start_year=2005):
+    """Strategy ⑤: Equal-weight ensemble of Strategies ①③④."""
+    s1, b1, _, _ = run_sector_rotation(prices, bm_rets, 3, [1,3,6,12], [.4,.3,.2,.1],
+                                       trend_win, tc, True, start_year)
+    s3, b3, _ = run_low_vol(prices, bm_rets, 3, 12, trend_win, tc, start_year)
+    s4, b4, _ = run_dual_momentum(prices, bm_rets, 3, trend_win, tc, start_year)
+    idx = s1.index.intersection(s3.index).intersection(s4.index)
+    s1, s3, s4 = s1[idx], s3[idx], s4[idx]
+    bm = b1.reindex(idx).fillna(0)
+    ensemble = (s1 + s3 + s4) / 3
+    return ensemble, bm
+
 
 # ─── Shared chart helpers ─────────────────────────────────────────────────────
 COLORS = {'strategy': '#3fb950', 'bm': '#f78166', 'alt': '#58a6ff', 'accent': '#ffd600'}
@@ -285,6 +332,8 @@ with st.sidebar:
         "① Sector Rotation (Original)",
         "② Index Momentum Rotation",
         "③ Dual-Momentum Sector (JoinQuant)",
+        "④ Low-Volatility Rotation",
+        "⑤ Multi-Strategy Ensemble",
     ])
     st.markdown("---")
 
@@ -298,11 +347,21 @@ with st.sidebar:
         ma_win     = st.slider("MA window (months)", 3, 24, 10)
         tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
         start_year = st.slider("Start year", 2010, 2015, 2011)
-    else:
+    elif strategy == "③ Dual-Momentum Sector (JoinQuant)":
         top_k      = st.slider("Top-K sectors", 1, 6, 3)
         trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
         tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
         start_year = st.slider("Start year", 2005, 2015, 2005)
+    elif strategy == "④ Low-Volatility Rotation":
+        top_k      = st.slider("Top-K sectors", 1, 6, 3)
+        vol_window = st.slider("Vol lookback (months)", 3, 24, 12)
+        trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
+        tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
+        start_year = st.slider("Start year", 2005, 2015, 2005)
+    else:  # ⑤ Ensemble
+        trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
+        tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
+        start_year = st.slider("Start year", 2005, 2015, 2006)
 
     st.markdown("---")
     st.caption("Data: Shenwan L1 indices + CSI broad indices via akshare")
@@ -382,7 +441,7 @@ elif strategy == "② Index Momentum Rotation":
 # ══════════════════════════════════════════════════════════════════════════════
 # STRATEGY ③ — Dual-Momentum Sector
 # ══════════════════════════════════════════════════════════════════════════════
-else:
+elif strategy == "③ Dual-Momentum Sector (JoinQuant)":
     st.title("③ Dual-Momentum Sector Rotation")
     st.caption("28 Shenwan L1 sectors · absolute + relative momentum · defensive fallback (Banking/Utilities/F&B)")
 
@@ -412,6 +471,79 @@ else:
             fig.update_layout(title="Regime Breakdown (months)", height=300,
                 margin=dict(l=20,r=20,t=45,b=20))
             st.plotly_chart(fig, use_container_width=True)
+
+    st.plotly_chart(yearly_chart(s, b, "Year-by-Year Returns"), use_container_width=True)
+    summary_table(sm, bm_m, alph, beta)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY ④ — Low-Volatility Rotation
+# ══════════════════════════════════════════════════════════════════════════════
+elif strategy == "④ Low-Volatility Rotation":
+    st.title("④ Low-Volatility Sector Rotation")
+    st.caption("28 Shenwan L1 sectors · lowest trailing-vol sectors · inverse-vol weighted · trend filter → cash")
+
+    with st.spinner("Loading data..."):
+        prices = load_sector_prices()
+        bm_series = load_index('sh000300')
+        bm_rets = bm_series.pct_change().dropna()
+
+    s, b, bt = run_low_vol(prices, bm_rets, top_k, vol_window, trend_win, tc_pct/100, start_year)
+    sm, bm_m = perf(s), perf(b)
+    alph, beta = alpha_beta(s, b)
+
+    st.caption(f"Backtest: **{s.index[0]:%Y-%m}** → **{s.index[-1]:%Y-%m}** · {sm['n']} months · Top-{top_k} sectors · {tc_pct:.2f}% one-way")
+    kpi_row(sm, bm_m, alph, beta)
+    st.markdown("---")
+
+    st.plotly_chart(cum_chart(s, b, f"Low-Vol Rotation Top-{top_k}",
+        "Cumulative Net Return (log scale) · grey = cash"), use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1: st.plotly_chart(dd_chart(s, b, f"Drawdown · Strategy {sm['mdd']:.1%} vs CSI300 {bm_m['mdd']:.1%}"), use_container_width=True)
+    with c2:
+        if 'mode' in bt.columns:
+            mc = bt['mode'].value_counts()
+            fig = go.Figure(go.Pie(labels=mc.index, values=mc.values, hole=.45,
+                marker_colors=[COLORS['strategy'],'#58a6ff','#e3b341','#8b949e']))
+            fig.update_layout(title="Regime Breakdown (months)", height=300,
+                margin=dict(l=20,r=20,t=45,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.plotly_chart(yearly_chart(s, b, "Year-by-Year Returns"), use_container_width=True)
+    summary_table(sm, bm_m, alph, beta)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY ⑤ — Multi-Strategy Ensemble
+# ══════════════════════════════════════════════════════════════════════════════
+else:
+    st.title("⑤ Multi-Strategy Ensemble")
+    st.caption("Equal-weight blend of ① Sector Rotation + ④ Low-Vol + ③ Dual-Momentum · diversifies strategy-specific risk")
+
+    with st.spinner("Loading data..."):
+        prices = load_sector_prices()
+        bm_series = load_index('sh000300')
+        bm_rets = bm_series.pct_change().dropna()
+
+    s, b = run_ensemble_blend(prices, bm_rets, trend_win, tc_pct/100, start_year)
+    sm, bm_m = perf(s), perf(b)
+    alph, beta = alpha_beta(s, b)
+
+    st.caption(f"Backtest: **{s.index[0]:%Y-%m}** → **{s.index[-1]:%Y-%m}** · {sm['n']} months · {tc_pct:.2f}% one-way")
+    kpi_row(sm, bm_m, alph, beta)
+    st.markdown("---")
+
+    st.plotly_chart(cum_chart(s, b, "Multi-Strategy Ensemble",
+        "Cumulative Net Return (log scale)"), use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1: st.plotly_chart(dd_chart(s, b, f"Drawdown · Ensemble {sm['mdd']:.1%} vs CSI300 {bm_m['mdd']:.1%}"), use_container_width=True)
+    with c2:
+        labels=['① Sector Rotation','④ Low-Vol','③ Dual-Momentum']
+        fig = go.Figure(go.Pie(labels=labels, values=[1,1,1], hole=.45,
+            marker_colors=[COLORS['strategy'], COLORS['alt'], COLORS['accent']]))
+        fig.update_layout(title="Equal-Weight Composition", height=300,
+            margin=dict(l=20,r=20,t=45,b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
     st.plotly_chart(yearly_chart(s, b, "Year-by-Year Returns"), use_container_width=True)
     summary_table(sm, bm_m, alph, beta)
