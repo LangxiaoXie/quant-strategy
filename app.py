@@ -9,7 +9,6 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import akshare as ak
-from sklearn.linear_model import LinearRegression
 
 st.set_page_config(page_title="A-Share Quant", page_icon="📈", layout="wide")
 
@@ -242,21 +241,25 @@ def _bias_score(close, bias_n, mom_day):
     if np.any(np.isnan(recent)) or recent[0] == 0:
         return np.nan
     y = recent / recent[0]
-    x = np.arange(len(y)).reshape(-1, 1)
-    return LinearRegression().fit(x, y).coef_[0] * 10000
+    x = np.arange(len(y), dtype=float)
+    slope = np.polyfit(x, y, 1)[0]
+    return slope * 10000
 
 
 def _slope_score(close, slope_n):
     """斜率动量: regression slope × R² on normalised prices."""
     if len(close) < slope_n:
         return np.nan
-    prices = close.iloc[-slope_n:].values.astype(float)
-    if np.any(np.isnan(prices)) or prices[0] == 0:
+    p = close.iloc[-slope_n:].values.astype(float)
+    if np.any(np.isnan(p)) or p[0] == 0:
         return np.nan
-    norm = prices / prices[0]
-    x = np.arange(1, slope_n + 1).reshape(-1, 1)
-    lr = LinearRegression().fit(x, norm)
-    return 10000 * lr.coef_[0] * lr.score(x, norm)
+    norm = p / p[0]
+    x = np.arange(1, slope_n + 1, dtype=float)
+    slope, intercept = np.polyfit(x, norm, 1)
+    ss_res = np.sum((norm - (slope * x + intercept)) ** 2)
+    ss_tot = np.sum((norm - norm.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    return 10000 * slope * r2
 
 
 def _efficiency_score(close, lookback):
