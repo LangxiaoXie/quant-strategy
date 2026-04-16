@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import akshare as ak
+from sklearn.linear_model import LinearRegression
 
 st.set_page_config(page_title="A-Share Quant", page_icon="📈", layout="wide")
 
@@ -232,6 +233,116 @@ def run_dual_momentum(prices, bm_rets, top_k, trend_win, tc, start_year):
     bt=pd.DataFrame(results).set_index('date')
     return bt['ret'], bm.reindex(bt.index).fillna(0), bt
 
+def _bias_score(close, bias_n, mom_day):
+    """乖离动量: linear trend of price-deviation-from-MA."""
+    if len(close) < bias_n + mom_day:
+        return np.nan
+    bias = close / close.rolling(bias_n).mean()
+    recent = bias.iloc[-mom_day:].values
+    if np.any(np.isnan(recent)) or recent[0] == 0:
+        return np.nan
+    y = recent / recent[0]
+    x = np.arange(len(y)).reshape(-1, 1)
+    return LinearRegression().fit(x, y).coef_[0] * 10000
+
+
+def _slope_score(close, slope_n):
+    """斜率动量: regression slope × R² on normalised prices."""
+    if len(close) < slope_n:
+        return np.nan
+    prices = close.iloc[-slope_n:].values.astype(float)
+    if np.any(np.isnan(prices)) or prices[0] == 0:
+        return np.nan
+    norm = prices / prices[0]
+    x = np.arange(1, slope_n + 1).reshape(-1, 1)
+    lr = LinearRegression().fit(x, norm)
+    return 10000 * lr.coef_[0] * lr.score(x, norm)
+
+
+def _efficiency_score(close, lookback):
+    """效率动量: log-return × efficiency ratio (net / total path)."""
+    if len(close) < lookback:
+        return np.nan
+    lp = np.log(close.iloc[-lookback:].values)
+    if lp[0] == 0:
+        return np.nan
+    mom = 100 * (lp[-1] - lp[0])
+    direction = abs(lp[-1] - lp[0])
+    total_path = np.abs(np.diff(lp)).sum()
+    er = direction / total_path if total_path > 0 else 0
+    return mom * er
+
+
+def _zscore(vals):
+    s = pd.Series(vals, dtype=float)
+    return (s - s.mean()) / s.std() if s.std() > 0 else s * 0
+
+
+def run_three_factor(prices, bm_rets, top_k=1, bias_n=20, slope_n=20, mom_day=12,
+                     eff_lb=12, w_bias=0.3, w_slope=0.3, w_eff=0.4,
+                     threshold=1.5, trend_win=10, tc=0.003, start_year=2005):
+    """
+    Strategy ⑥: Three-Factor ETF Rotation (乖离+斜率+效率动量, Z-score normalised).
+    Weights: bias 0.3, slope 0.3, efficiency 0.4.
+    Rebalance threshold: only switch when new_best > current_best × threshold.
+    """
+    prices = prices[prices.index.year >= start_year].copy()
+    bm     = bm_rets[bm_rets.index.year >= start_year].copy()
+    bm_lvl = (1 + bm).cumprod()
+    bm_aln = bm_lvl.reindex(prices.index, method='ffill')
+    trend  = (bm_aln > bm_aln.rolling(trend_win).mean()).shift(1)
+
+    min_hist = max(bias_n + mom_day, slope_n, eff_lb) + 2
+    results = []; held = set(); held_scores = {}
+
+    for t in range(min_hist, len(prices)):
+        date = prices.index[t]
+        in_mkt = bool(trend.iloc[t]) if pd.notna(trend.iloc[t]) else True
+        if not in_mkt:
+            results.append({'date': date, 'ret': 0.}); held = set(); continue
+
+        # Compute composite score for each sector
+        raw = {'bias': {}, 'slope': {}, 'eff': {}}
+        for col in prices.columns:
+            c = prices[col].iloc[:t+1]
+            raw['bias'][col]  = _bias_score(c, bias_n, mom_day)
+            raw['slope'][col] = _slope_score(c, slope_n)
+            raw['eff'][col]   = _efficiency_score(c, eff_lb)
+
+        zb = _zscore(list(raw['bias'].values()))
+        zs = _zscore(list(raw['slope'].values()))
+        ze = _zscore(list(raw['eff'].values()))
+        cols = list(prices.columns)
+        composite = {col: w_bias*zb.iloc[i] + w_slope*zs.iloc[i] + w_eff*ze.iloc[i]
+                     for i, col in enumerate(cols)
+                     if pd.notna(zb.iloc[i]) and pd.notna(zs.iloc[i]) and pd.notna(ze.iloc[i])}
+
+        if len(composite) < top_k:
+            results.append({'date': date, 'ret': 0.}); continue
+
+        sc = pd.Series(composite)
+        top_new = set(sc.nlargest(top_k).index)
+
+        # Threshold filter (only for top_k=1)
+        if top_k == 1 and held:
+            best_new = sc.idxmax()
+            best_old = next(iter(held))
+            if best_old in sc and sc[best_new] < sc.get(best_old, -np.inf) * threshold:
+                top_new = held  # stay
+
+        prev = prices.index[t - 1]
+        turn = len(held - top_new) / top_k if held else 1.
+        pr = [(prices.loc[date, c] / prices.loc[prev, c]) - 1
+              for c in top_new if pd.notna(prices.loc[prev, c]) and prices.loc[prev, c] > 0]
+        net = (np.mean(pr) if pr else 0.) - turn * tc * 2
+        results.append({'date': date, 'ret': net, 'held': ','.join(sorted(top_new)),
+                        'top_score': sc[next(iter(top_new))]})
+        held = top_new
+
+    bt = pd.DataFrame(results).set_index('date')
+    return bt['ret'], bm.reindex(bt.index).fillna(0), bt, sc
+
+
 def run_ensemble_blend(prices, bm_rets, trend_win=10, tc=0.003, start_year=2005):
     """Strategy ⑤: Equal-weight ensemble of Strategies ①③④."""
     s1, b1, _, _ = run_sector_rotation(prices, bm_rets, 3, [1,3,6,12], [.4,.3,.2,.1],
@@ -334,6 +445,7 @@ with st.sidebar:
         "③ Dual-Momentum Sector (JoinQuant)",
         "④ Low-Volatility Rotation",
         "⑤ Multi-Strategy Ensemble",
+        "⑥ Three-Factor Momentum (乖离+斜率+效率)",
     ])
     st.markdown("---")
 
@@ -358,7 +470,17 @@ with st.sidebar:
         trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
         tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
         start_year = st.slider("Start year", 2005, 2015, 2005)
-    else:  # ⑤ Ensemble
+    elif strategy == "⑤ Multi-Strategy Ensemble":
+        trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
+        tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
+        start_year = st.slider("Start year", 2005, 2015, 2006)
+    else:  # ⑥ Three-Factor
+        top_k      = st.slider("Top-K sectors", 1, 5, 1)
+        bias_n     = st.slider("Bias MA window (months)", 6, 36, 20)
+        slope_n    = st.slider("Slope lookback (months)", 6, 36, 20)
+        mom_day    = st.slider("Bias regression window (months)", 3, 24, 12)
+        eff_lb     = st.slider("Efficiency lookback (months)", 3, 24, 12)
+        threshold  = st.slider("Rebalance threshold", 1.0, 3.0, 1.5, 0.1)
         trend_win  = st.slider("Trend filter (months)", 3, 24, 10)
         tc_pct     = st.slider("Transaction cost (one-way %)", 0.0, 1.0, 0.3, 0.05)
         start_year = st.slider("Start year", 2005, 2015, 2006)
@@ -515,7 +637,7 @@ elif strategy == "④ Low-Volatility Rotation":
 # ══════════════════════════════════════════════════════════════════════════════
 # STRATEGY ⑤ — Multi-Strategy Ensemble
 # ══════════════════════════════════════════════════════════════════════════════
-else:
+elif strategy == "⑤ Multi-Strategy Ensemble":
     st.title("⑤ Multi-Strategy Ensemble")
     st.caption("Equal-weight blend of ① Sector Rotation + ④ Low-Vol + ③ Dual-Momentum · diversifies strategy-specific risk")
 
@@ -543,6 +665,46 @@ else:
             marker_colors=[COLORS['strategy'], COLORS['alt'], COLORS['accent']]))
         fig.update_layout(title="Equal-Weight Composition", height=300,
             margin=dict(l=20,r=20,t=45,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.plotly_chart(yearly_chart(s, b, "Year-by-Year Returns"), use_container_width=True)
+    summary_table(sm, bm_m, alph, beta)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY ⑥ — Three-Factor Momentum
+# ══════════════════════════════════════════════════════════════════════════════
+else:
+    st.title("⑥ Three-Factor Momentum Rotation")
+    st.caption("乖离动量 × 斜率动量 × 效率动量 · Z-score normalised · rebalance threshold · trend filter → cash")
+
+    with st.spinner("Computing three-factor scores… (may take ~30s)"):
+        prices = load_sector_prices()
+        bm_series = load_index('sh000300')
+        bm_rets = bm_series.pct_change().dropna()
+
+    s, b, bt, last_scores = run_three_factor(
+        prices, bm_rets, top_k=top_k, bias_n=bias_n, slope_n=slope_n,
+        mom_day=mom_day, eff_lb=eff_lb, w_bias=0.3, w_slope=0.3, w_eff=0.4,
+        threshold=threshold, trend_win=trend_win, tc=tc_pct/100, start_year=start_year)
+    sm, bm_m = perf(s), perf(b)
+    alph, beta = alpha_beta(s, b)
+
+    st.caption(f"Backtest: **{s.index[0]:%Y-%m}** → **{s.index[-1]:%Y-%m}** · {sm['n']} months · Top-{top_k} · threshold ×{threshold:.1f} · {tc_pct:.2f}% one-way")
+    kpi_row(sm, bm_m, alph, beta)
+    st.markdown("---")
+
+    st.plotly_chart(cum_chart(s, b, f"Three-Factor Rotation Top-{top_k}",
+        "Cumulative Net Return (log scale) · grey = cash"), use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(dd_chart(s, b, f"Drawdown · Strategy {sm['mdd']:.1%} vs CSI300 {bm_m['mdd']:.1%}"), use_container_width=True)
+    with c2:
+        top_now = last_scores.sort_values(ascending=True).tail(15)
+        colors = ['#3fb950' if i >= len(top_now) - top_k else '#8b949e' for i in range(len(top_now))]
+        fig = go.Figure(go.Bar(x=top_now.values, y=top_now.index, orientation='h', marker_color=colors))
+        fig.update_layout(title=f"Current Three-Factor Scores (Top-{top_k} in green)", height=300,
+            margin=dict(l=130, r=15, t=45, b=35))
         st.plotly_chart(fig, use_container_width=True)
 
     st.plotly_chart(yearly_chart(s, b, "Year-by-Year Returns"), use_container_width=True)
