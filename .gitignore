@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.png
 .DS_Store
+
+# Runtime state and logs — signal.log has contained Server醬 key prefixes,
+# and holdings.json is live position state, not source.
+signal.log
+holdings.json
+.quant_config
